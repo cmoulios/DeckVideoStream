@@ -16,6 +16,26 @@ public struct FrameTable: Sendable {
     public let syncIndices: [Int32]
     /// How the table was built (diagnostic).
     public let builtWith: Builder
+    /// Median PTS delta — robust to VFR jitter and to a few dropped
+    /// frames. Computed once here: the worker reads it every pass.
+    public let nominalFrameDurationSeconds: Double
+
+    public init(timescale: CMTimeScale, pts: [Int64], decodeOrdinal: [Int32],
+                syncIndices: [Int32], builtWith: Builder) {
+        self.timescale = timescale
+        self.pts = pts
+        self.decodeOrdinal = decodeOrdinal
+        self.syncIndices = syncIndices
+        self.builtWith = builtWith
+        if pts.count > 1 {
+            var deltas = [Int64](); deltas.reserveCapacity(pts.count - 1)
+            for i in 1..<pts.count { deltas.append(pts[i] - pts[i - 1]) }
+            deltas.sort()
+            nominalFrameDurationSeconds = Double(deltas[deltas.count / 2]) / Double(timescale)
+        } else {
+            nominalFrameDurationSeconds = 0
+        }
+    }
 
     public enum Builder: String, Sendable { case sampleCursor, passthroughReader }
 
@@ -28,14 +48,6 @@ public struct FrameTable: Sendable {
     public var durationSeconds: Double {
         guard let last = pts.last else { return 0 }
         return Double(last) / Double(timescale) + nominalFrameDurationSeconds
-    }
-    /// Median PTS delta — robust to VFR jitter and to a few dropped frames.
-    public var nominalFrameDurationSeconds: Double {
-        guard pts.count > 1 else { return 0 }
-        var deltas = [Int64](); deltas.reserveCapacity(pts.count - 1)
-        for i in 1..<pts.count { deltas.append(pts[i] - pts[i - 1]) }
-        deltas.sort()
-        return Double(deltas[deltas.count / 2]) / Double(timescale)
     }
 
     public func seconds(at index: Int) -> Double {
