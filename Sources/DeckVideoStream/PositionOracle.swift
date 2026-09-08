@@ -27,7 +27,8 @@ public struct PositionOracle: Sendable {
 
 /// A loop the deck is (or is about to be) playing, in file seconds,
 /// `outSeconds` exclusive. The stream pins the whole range when it fits
-/// the budget, else just the wrap-target head, so a wrap never waits on
+/// the budget, else just the wrap-target head (which is exempt from the
+/// shared budget — small, and the whole point), so a wrap never waits on
 /// a decode. Because engines commonly apply a wrap a little early (a
 /// prefill ring's depth ahead of the audible position), the pinned range
 /// starts `Configuration.hintPaddingSeconds` before `inSeconds`.

@@ -51,6 +51,15 @@ public final class MemoryBudget: Sendable {
         }
     }
 
+    /// Take `bytes` regardless of the limit — for a loop's wrap-target
+    /// head, which is small and is the whole point of pinning: a budget
+    /// too tight for a deck's loop must not leave its wrap unserved
+    /// because another deck's loop fit first. Still counted, so the total
+    /// stays honest.
+    func reserveUnchecked(_ bytes: Int) {
+        pinnedBytes.wrappingAdd(bytes, ordering: .relaxed)
+    }
+
     func release(_ bytes: Int) {
         pinnedBytes.wrappingSubtract(bytes, ordering: .relaxed)
     }

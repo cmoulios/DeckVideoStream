@@ -447,14 +447,18 @@ public final class DeckVideoStream: @unchecked Sendable {
             let first = w.first
             var length = w.length, key = w.key
             var bytes = length * session.bytesPerFrame
-            if !budget.reserve(bytes) {
+            if case .loopHead = key {
+                // The head is exempt from the shared budget (see
+                // MemoryBudget.reserveUnchecked).
+                budget.reserveUnchecked(bytes)
+            } else if !budget.reserve(bytes) {
                 // Over the shared budget: a loop degrades to its head, a
                 // cue is skipped.
                 guard case .loop(let hint) = key else { continue }
                 key = .loopHead(hint)
                 length = min(length, pad + head)
                 bytes = length * session.bytesPerFrame
-                guard budget.reserve(bytes) else { continue }
+                budget.reserveUnchecked(bytes)
             }
             if configuration.verbose {
                 print("[dvs] pin \(key) frames \(first)...\(first + length - 1) (\(bytes >> 20) MB)")
