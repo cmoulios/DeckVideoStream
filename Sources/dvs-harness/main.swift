@@ -305,6 +305,7 @@ func stream(_ src: VideoSource, args: Args) throws {
     let fmt = args.format(.nv12VideoRange)
     var cfg = Configuration()
     cfg.pixelFormat = fmt
+    cfg.verbose = args.options["verbose"] != nil
     let hz = Double(args.int("hz", 60))
     let seconds = Double(args.int("seconds", 4))
 

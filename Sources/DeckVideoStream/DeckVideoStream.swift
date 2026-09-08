@@ -52,6 +52,11 @@ public final class DeckVideoStream: @unchecked Sendable {
     /// Consumer's latest request, for the worker's eviction floor.
     private let consumerIndex = Atomic<Int>(-1)
 
+    /// Frames kept past a run's sampled upper edge (see eviction).
+    private static let evictionMarginFrames = 3
+    /// A reader this far behind a missing frame continues instead of restarting.
+    private static let forwardToleranceFrames = 16
+
     /// Everything tied to one opened file. Replaced wholesale on open/close.
     private final class Session: @unchecked Sendable {
         let source: VideoSource
@@ -150,9 +155,22 @@ public final class DeckVideoStream: @unchecked Sendable {
 
     // MARK: Consumer surface
 
+    /// What `lookup(at:)` resolved: the index the time maps to, and the
+    /// frame served for it (exact, nearest-earlier, or none).
+    public struct Lookup {
+        public let requestedIndex: Int
+        public let frame: Frame?
+    }
+
     /// The frame for `fileSeconds` if resident, else the nearest earlier
     /// frame within `backscanFrames`, else nil. Never blocks on the worker.
     public func frame(at fileSeconds: Double) -> Frame? {
+        lookup(at: fileSeconds)?.frame
+    }
+
+    /// `frame(at:)` plus the requested index, for consumers that keep
+    /// their own expected/delivered accounting. nil = no file open.
+    public func lookup(at fileSeconds: Double) -> Lookup? {
         lock.lock()
         guard let session else {
             lock.unlock()
@@ -177,15 +195,16 @@ public final class DeckVideoStream: @unchecked Sendable {
         }
         guard let buffer else {
             health.misses.wrappingAdd(1, ordering: .relaxed)
-            return nil
+            return Lookup(requestedIndex: index, frame: nil)
         }
         if hitIndex != lastDeliveredIndex {
             lastDeliveredIndex = hitIndex
             health.deliveredFrames.wrappingAdd(1, ordering: .relaxed)
         }
         if !exact { health.staleFrames.wrappingAdd(1, ordering: .relaxed) }
-        return Frame(pixelBuffer: buffer, index: hitIndex,
-                     presentationSeconds: table.seconds(at: hitIndex), isExact: exact)
+        let frame = Frame(pixelBuffer: buffer, index: hitIndex,
+                          presentationSeconds: table.seconds(at: hitIndex), isExact: exact)
+        return Lookup(requestedIndex: index, frame: frame)
     }
 
     // MARK: Worker
@@ -277,11 +296,13 @@ public final class DeckVideoStream: @unchecked Sendable {
         // sequential path: swap rather than restart.
         if let missing = firstMissing(in: primary, session: session),
            live?.nextIndex != missing, aux?.nextIndex == missing {
+            if configuration.verbose { print("[dvs] swap live↔aux at \(missing)") }
             swap(&live, &aux)
         }
         serve(run: primary, reader: &live, session: session, isLive: true)
         if let secondary = runs.first(where: { $0 != primary && firstMissing(in: $0, session: session) != nil }) {
-            serve(run: secondary, reader: &aux, session: session, isLive: false)
+            let padded = max(0, secondary.lowerBound - cfg.runGapToleranceFrames)...secondary.upperBound
+            serve(run: padded, reader: &aux, session: session, isLive: false)
         } else if aux != nil, runs.count == 1 {
             aux?.source.cancel()
             aux = nil
@@ -289,12 +310,16 @@ public final class DeckVideoStream: @unchecked Sendable {
 
         // Evict everything outside the runs (plus a little history behind
         // whatever the consumer last asked for).
+        // The sampling grid is not frame-aligned, so a run's edges flicker
+        // by a frame between passes; keep a margin past each edge or the
+        // edge frame is evicted and re-decoded (from its keyframe) forever.
         let behind = Int((cfg.lookbehindSeconds / frameDuration).rounded(.up)) + cfg.backscanFrames
+        let ahead = Self.evictionMarginFrames
         let consumer = consumerIndex.load(ordering: .relaxed)
         lock.lock()
         session.ring.retain { index in
             if consumer >= 0, index <= consumer, index >= consumer - behind { return true }
-            for run in runs where index >= run.lowerBound - behind && index <= run.upperBound { return true }
+            for run in runs where index >= run.lowerBound - behind && index <= run.upperBound + ahead { return true }
             return false
         }
         let resident = session.ring.count * session.bytesPerFrame
@@ -318,14 +343,28 @@ public final class DeckVideoStream: @unchecked Sendable {
         guard var r = reader else { return }
         defer { reader = r }
 
-        if r.nextIndex != missing {
+        // A reader just behind the missing frame keeps going: the frames in
+        // between are needed anyway (or cheap), and a restart would pay the
+        // GOP prefix again. Restart only when it is past the target or far
+        // behind it.
+        let continues: Bool = {
+            guard let next = r.nextIndex else { return false }
+            return next <= missing && missing - next <= Self.forwardToleranceFrames
+        }()
+        if !continues {
             if r.failedAt == missing { return }
+            if configuration.verbose {
+                print(String(format: "[dvs] %@ restart → %d (was next %@, run %d...%d, failedAt %@)",
+                             isLive ? "live" : "aux ", missing,
+                             r.nextIndex.map(String.init) ?? "nil", run.lowerBound, run.upperBound,
+                             r.failedAt.map(String.init) ?? "nil"))
+            }
             do {
                 try r.source.start(atIndex: missing)
                 r.nextIndex = missing
                 r.failedAt = nil
-                r.startedAt = HostClock.seconds()
-                r.startTarget = missing
+                r.startedAt = isLive ? HostClock.seconds() : nil
+                r.startTarget = isLive ? missing : nil
                 if isLive { health.coldStarts.wrappingAdd(1, ordering: .relaxed) }
             } catch {
                 r.failedAt = missing
@@ -338,11 +377,17 @@ public final class DeckVideoStream: @unchecked Sendable {
         while decoded < configuration.decodeChunk, let expected = r.nextIndex, expected <= run.upperBound {
             guard let frame = r.source.next() else {
                 // EOF or reader error: don't spin on it.
+                if configuration.verbose {
+                    print("[dvs] \(isLive ? "live" : "aux ") next() nil at expected \(expected) status \(String(describing: r.source.status)) error \(String(describing: r.source.error))")
+                }
                 r.nextIndex = nil
                 r.failedAt = expected
                 break
             }
             let index = table.index(for: frame.presentationTime)
+            if configuration.verbose, index != expected {
+                print("[dvs] \(isLive ? "live" : "aux ") emitted \(index) expected \(expected)")
+            }
             lock.lock()
             session.ring.insert(frame.pixelBuffer, at: index)
             lock.unlock()

@@ -44,6 +44,8 @@ public struct Configuration: Sendable {
     public var backscanFrames: Int = 4
     /// Oracle samples closer than this (in frames) merge into one decode run.
     public var runGapToleranceFrames: Int = 2
+    /// Print worker decisions (restarts, swaps) to stdout. Diagnostics only.
+    public var verbose: Bool = false
 
     public init() {}
 }
