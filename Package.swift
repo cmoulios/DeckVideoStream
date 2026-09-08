@@ -3,7 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "DeckVideoStream",
-    platforms: [.macOS(.v14), .iOS(.v17)],
+    platforms: [.macOS(.v15), .iOS(.v18)],
     products: [
         .library(name: "DeckVideoStream", targets: ["DeckVideoStream"]),
         .executable(name: "dvs-harness", targets: ["dvs-harness"]),

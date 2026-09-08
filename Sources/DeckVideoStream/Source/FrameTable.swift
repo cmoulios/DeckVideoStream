@@ -48,10 +48,23 @@ public struct FrameTable: Sendable {
     }
 
     /// Last frame whose presentation time is <= `seconds` (clamped to the
-    /// table's range). O(log n), no allocation.
+    /// table's range). O(log n), no allocation. Rounds to the nearest
+    /// tick so a time that IS a frame's timestamp, arrived at through
+    /// floating point, lands on that frame rather than the one before.
     public func index(forSeconds seconds: Double) -> Int {
+        index(forTicks: Int64((seconds * Double(timescale)).rounded()))
+    }
+
+    /// Same lookup from an exact `CMTime` (rescaled if needed).
+    public func index(for time: CMTime) -> Int {
+        let ticks = time.timescale == timescale
+            ? time.value
+            : CMTimeConvertScale(time, timescale: timescale, method: .default).value
+        return index(forTicks: ticks)
+    }
+
+    public func index(forTicks target: Int64) -> Int {
         guard !pts.isEmpty else { return 0 }
-        let target = Int64((seconds * Double(timescale)).rounded(.down))
         var lo = 0, hi = pts.count
         while lo < hi {
             let mid = (lo + hi) >> 1

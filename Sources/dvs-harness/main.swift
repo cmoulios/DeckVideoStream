@@ -6,6 +6,7 @@
 //   dvs-harness reorder <file> [--gops N]
 //   dvs-harness pin <file> [--frames N] [--format F]
 //   dvs-harness alpha <file>
+//   dvs-harness stream <file> [--format F] [--hz 60] [--seconds 4]
 
 import AVFoundation
 import DeckVideoStream
@@ -295,6 +296,98 @@ func fourCCString(_ code: OSType) -> String {
     return String(bytes: bytes, encoding: .macOSRoman) ?? String(code)
 }
 
+/// End-to-end: drive a DeckVideoStream with a synthetic oracle at 60 Hz
+/// and count exact / stale / missing answers per phase.
+///   phases: play at ratio 1.0 (4 s) → ratio 1.25 (4 s) → 2 s loop wrapping (6 s)
+///           → epoch jump to +60 s (4 s) → play at 0.8 (4 s)
+func stream(_ src: VideoSource, args: Args) throws {
+    printInfo(src.info)
+    let fmt = args.format(.nv12VideoRange)
+    var cfg = Configuration()
+    cfg.pixelFormat = fmt
+    let hz = Double(args.int("hz", 60))
+    let seconds = Double(args.int("seconds", 4))
+
+    // Synthetic clock model, shared with the oracle (read on the worker).
+    final class Model: @unchecked Sendable {
+        let lock = NSLock()
+        var anchorHost: HostTicks = HostClock.now()
+        var anchorFile: Double = 5.0
+        var ratio: Double = 1.0
+        var loop: (inS: Double, outS: Double)? = nil
+        var epoch: UInt64 = 0
+        func position(at host: HostTicks) -> Double? {
+            lock.lock(); defer { lock.unlock() }
+            let elapsed = HostClock.seconds(from: anchorHost, to: host) * ratio
+            var p = anchorFile + elapsed
+            if let loop {
+                let len = loop.outS - loop.inS
+                if p >= loop.inS { p = loop.inS + (p - loop.inS).truncatingRemainder(dividingBy: len) }
+            }
+            return p
+        }
+        func set(file: Double? = nil, ratio r: Double? = nil, loop l: (Double, Double)?? = nil, bumpEpoch: Bool = false) {
+            lock.lock(); defer { lock.unlock() }
+            let now = HostClock.now()
+            let current = anchorFile + HostClock.seconds(from: anchorHost, to: now) * ratio
+            anchorHost = now
+            anchorFile = file ?? current
+            if let r { ratio = r }
+            if let l { loop = l.map { (inS: $0.0, outS: $0.1) } }
+            if bumpEpoch { epoch &+= 1 }
+        }
+    }
+    let model = Model()
+    let oracle = PositionOracle(fileSeconds: { model.position(at: $0) }, epoch: { model.lock.lock(); defer { model.lock.unlock() }; return model.epoch })
+    let stream = DeckVideoStream(configuration: cfg, oracle: oracle, label: "dvs.harness")
+    stream.open(src.url)
+    let tOpen = HostClock.seconds()
+    while stream.info == nil { Thread.sleep(forTimeInterval: 0.005) }
+    print(String(format: "open → indexed in %.1f ms", (HostClock.seconds() - tOpen) * 1000))
+
+    struct Phase { let name: String; let seconds: Double; let apply: () -> Void }
+    let phases = [
+        Phase(name: "ratio 1.0", seconds: seconds) { },
+        Phase(name: "ratio 1.25", seconds: seconds) { model.set(ratio: 1.25) },
+        Phase(name: "2 s loop", seconds: seconds + 2) { model.set(ratio: 1.0); let p = model.position(at: HostClock.now()) ?? 0; model.set(loop: .some((p, p + 2.0))) },
+        Phase(name: "jump +60 s", seconds: seconds) { model.set(file: (model.position(at: HostClock.now()) ?? 0) + 60, loop: .some(nil), bumpEpoch: true) },
+        Phase(name: "ratio 0.8", seconds: seconds) { model.set(ratio: 0.8) },
+    ]
+    print("phase        ticks  exact  stale   miss   settle     cold  worstDec resident")
+    for phase in phases {
+        phase.apply()
+        let tStart = HostClock.seconds()
+        var exact = 0, stale = 0, miss = 0, ticks = 0
+        var settled: Double? = nil
+        var worstLatency: UInt64 = 0
+        let cold0 = stream.health.coldStarts.load(ordering: .relaxed)
+        var next = tStart
+        while HostClock.seconds() - tStart < phase.seconds {
+            next += 1 / hz
+            let now = HostClock.now()
+            guard let want = model.position(at: now) else { continue }
+            let expectedIndex = src.table.index(forSeconds: want)
+            if let f = stream.frame(at: want) {
+                if f.index == expectedIndex { exact += 1; if settled == nil { settled = HostClock.seconds() - tStart } }
+                else { stale += 1 }
+            } else { miss += 1 }
+            ticks += 1
+            worstLatency = max(worstLatency, stream.health.takeWorstDecodeLatencyNanos())
+            let sleep = next - HostClock.seconds()
+            if sleep > 0 { Thread.sleep(forTimeInterval: sleep) }
+        }
+        let cold = stream.health.coldStarts.load(ordering: .relaxed) - cold0
+        print(String(format: "%-12@ %6d %6d %6d %6d %7.0fms %8d %7.1fms %@",
+                     phase.name as NSString, ticks, exact, stale, miss, (settled ?? -1) * 1000, cold,
+                     Double(worstLatency) / 1e6, mb(stream.health.residentBytes.load(ordering: .relaxed)) as NSString))
+    }
+    let h = stream.health
+    print("health: expected \(h.expectedFrames.load(ordering: .relaxed)) delivered \(h.deliveredFrames.load(ordering: .relaxed)) decoded \(h.decodedFrames.load(ordering: .relaxed)) epochChanges \(h.epochChanges.load(ordering: .relaxed))")
+    stream.open(nil)
+    Thread.sleep(forTimeInterval: 0.2)
+    print("closed: resident \(mb(h.residentBytes.load(ordering: .relaxed)))")
+}
+
 // MARK: - Main
 
 guard let args = Args(CommandLine.arguments) else {
@@ -311,6 +404,7 @@ do {
     case "reorder": try reorder(src, args: args)
     case "pin": try pin(src, args: args)
     case "alpha": try alpha(src, args: args)
+    case "stream": try stream(src, args: args)
     default: print("unknown command \(args.command)"); exit(2)
     }
 } catch {

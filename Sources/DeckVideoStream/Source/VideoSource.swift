@@ -86,9 +86,33 @@ func fourCC(_ code: FourCharCode) -> String {
     return String(bytes: bytes, encoding: .macOSRoman) ?? String(code)
 }
 
+/// `mach_absolute_time` ticks — the clock family audio engines anchor to.
+public typealias HostTicks = UInt64
+
 public enum HostClock {
     /// Monotonic seconds (CLOCK_UPTIME_RAW — same family as mach_absolute_time).
     public static func seconds() -> Double {
         Double(clock_gettime_nsec_np(CLOCK_UPTIME_RAW)) / 1e9
+    }
+
+    public static func now() -> HostTicks { mach_absolute_time() }
+
+    /// Seconds per tick; numer/denom is not 1:1 on every machine.
+    public static let secondsPerTick: Double = {
+        var tb = mach_timebase_info_data_t()
+        mach_timebase_info(&tb)
+        return Double(tb.numer) / Double(tb.denom) / 1e9
+    }()
+
+    public static func ticks(adding seconds: Double, to base: HostTicks) -> HostTicks {
+        let delta = seconds / secondsPerTick
+        if delta >= 0 { return base &+ HostTicks(delta) }
+        let back = HostTicks(-delta)
+        return back > base ? 0 : base - back
+    }
+
+    /// Signed seconds from `from` to `to`.
+    public static func seconds(from: HostTicks, to: HostTicks) -> Double {
+        to >= from ? Double(to - from) * secondsPerTick : -Double(from - to) * secondsPerTick
     }
 }
