@@ -316,18 +316,37 @@ func stream(_ src: VideoSource, args: Args) throws {
         var anchorFile: Double = 5.0
         var ratio: Double = 1.0
         var loop: (inS: Double, outS: Double)? = nil
+        /// Engine-like: the mapping is affine (no wrap prediction); a
+        /// worker applies the wrap when the position `preApplySeconds`
+        /// ahead reaches loop-out, shifting the anchor back by the loop
+        /// length — exactly what Fringe's prefill worker does at the fill
+        /// horizon. The visible position therefore jumps to in − preApply.
+        var engineLoop = false
+        let preApplySeconds = 0.186
+        var wraps = 0
         var epoch: UInt64 = 0
         func position(at host: HostTicks) -> Double? {
             lock.lock(); defer { lock.unlock() }
             let elapsed = HostClock.seconds(from: anchorHost, to: host) * ratio
             var p = anchorFile + elapsed
-            if let loop {
+            if let loop, !engineLoop {
                 let len = loop.outS - loop.inS
                 if p >= loop.inS { p = loop.inS + (p - loop.inS).truncatingRemainder(dividingBy: len) }
             }
             return p
         }
-        func set(file: Double? = nil, ratio r: Double? = nil, loop l: (Double, Double)?? = nil, bumpEpoch: Bool = false) {
+        /// Called by the harness tick (the "prefill worker").
+        func applyWrapIfDue() {
+            lock.lock(); defer { lock.unlock() }
+            guard let loop, engineLoop else { return }
+            let ahead = anchorFile + (HostClock.seconds(from: anchorHost, to: HostClock.now()) + preApplySeconds) * ratio
+            if ahead >= loop.outS {
+                anchorFile -= (loop.outS - loop.inS)
+                wraps += 1
+            }
+        }
+        func set(file: Double? = nil, ratio r: Double? = nil, loop l: (Double, Double)?? = nil,
+                 engineLoop e: Bool? = nil, bumpEpoch: Bool = false) {
             lock.lock(); defer { lock.unlock() }
             let now = HostClock.now()
             let current = anchorFile + HostClock.seconds(from: anchorHost, to: now) * ratio
@@ -335,6 +354,7 @@ func stream(_ src: VideoSource, args: Args) throws {
             anchorFile = file ?? current
             if let r { ratio = r }
             if let l { loop = l.map { (inS: $0.0, outS: $0.1) } }
+            if let e { engineLoop = e }
             if bumpEpoch { epoch &+= 1 }
         }
     }
@@ -347,14 +367,25 @@ func stream(_ src: VideoSource, args: Args) throws {
     print(String(format: "open → indexed in %.1f ms", (HostClock.seconds() - tOpen) * 1000))
 
     struct Phase { let name: String; let seconds: Double; let apply: () -> Void }
+    let loopSeconds = Double(args.int("loop-seconds", 2))
+    let cueTarget = 100.0
     let phases = [
         Phase(name: "ratio 1.0", seconds: seconds) { },
         Phase(name: "ratio 1.25", seconds: seconds) { model.set(ratio: 1.25) },
-        Phase(name: "2 s loop", seconds: seconds + 2) { model.set(ratio: 1.0); let p = model.position(at: HostClock.now()) ?? 0; model.set(loop: .some((p, p + 2.0))) },
-        Phase(name: "jump +60 s", seconds: seconds) { model.set(file: (model.position(at: HostClock.now()) ?? 0) + 60, loop: .some(nil), bumpEpoch: true) },
+        Phase(name: "loop predict", seconds: seconds + 2) { model.set(ratio: 1.0); let p = model.position(at: HostClock.now()) ?? 0; model.set(loop: .some((p, p + loopSeconds))) },
+        Phase(name: "loop engine", seconds: seconds + 2) { model.set(engineLoop: true) },
+        Phase(name: "loop hinted", seconds: seconds + 2) {
+            let l = model.loop!
+            stream.setLoopHint(LoopHint(inSeconds: l.inS, outSeconds: l.outS))
+            // give the pin a moment to fill before counting
+            Thread.sleep(forTimeInterval: 0.6)
+        },
+        Phase(name: "cue hinted", seconds: 1.5) { stream.setCueHints([cueTarget]); Thread.sleep(forTimeInterval: 0.6) },
+        Phase(name: "jump→cue", seconds: seconds) { model.set(file: cueTarget, loop: .some(nil), engineLoop: false, bumpEpoch: true); stream.setLoopHint(nil) },
+        Phase(name: "jump +60 s", seconds: seconds) { model.set(file: (model.position(at: HostClock.now()) ?? 0) + 60, bumpEpoch: true) },
         Phase(name: "ratio 0.8", seconds: seconds) { model.set(ratio: 0.8) },
     ]
-    print("phase        ticks  exact  stale   miss   settle     cold  worstDec resident")
+    print("phase        ticks  exact  stale   miss   settle     cold  worstDec resident  pinned  wraps")
     for phase in phases {
         phase.apply()
         let tStart = HostClock.seconds()
@@ -362,9 +393,11 @@ func stream(_ src: VideoSource, args: Args) throws {
         var settled: Double? = nil
         var worstLatency: UInt64 = 0
         let cold0 = stream.health.coldStarts.load(ordering: .relaxed)
+        let wraps0 = model.wraps
         var next = tStart
         while HostClock.seconds() - tStart < phase.seconds {
             next += 1 / hz
+            model.applyWrapIfDue()
             let now = HostClock.now()
             guard let want = model.position(at: now) else { continue }
             let expectedIndex = src.table.index(forSeconds: want)
@@ -378,12 +411,13 @@ func stream(_ src: VideoSource, args: Args) throws {
             if sleep > 0 { Thread.sleep(forTimeInterval: sleep) }
         }
         let cold = stream.health.coldStarts.load(ordering: .relaxed) - cold0
-        print(String(format: "%-12@ %6d %6d %6d %6d %7.0fms %8d %7.1fms %@",
+        print(String(format: "%-12@ %6d %6d %6d %6d %7.0fms %8d %7.1fms %@  %@  %d",
                      phase.name as NSString, ticks, exact, stale, miss, (settled ?? -1) * 1000, cold,
-                     Double(worstLatency) / 1e6, mb(stream.health.residentBytes.load(ordering: .relaxed)) as NSString))
+                     Double(worstLatency) / 1e6, mb(stream.health.residentBytes.load(ordering: .relaxed)) as NSString,
+                     mb(stream.health.pinnedBytes.load(ordering: .relaxed)) as NSString, model.wraps - wraps0))
     }
     let h = stream.health
-    print("health: expected \(h.expectedFrames.load(ordering: .relaxed)) delivered \(h.deliveredFrames.load(ordering: .relaxed)) decoded \(h.decodedFrames.load(ordering: .relaxed)) epochChanges \(h.epochChanges.load(ordering: .relaxed))")
+    print("health: expected \(h.expectedFrames.load(ordering: .relaxed)) delivered \(h.deliveredFrames.load(ordering: .relaxed)) decoded \(h.decodedFrames.load(ordering: .relaxed)) epochChanges \(h.epochChanges.load(ordering: .relaxed)) pinHits \(h.pinHits.load(ordering: .relaxed)) budgetPinned \(mb(MemoryBudget.shared.pinnedBytes.load(ordering: .relaxed)))")
     stream.open(nil)
     Thread.sleep(forTimeInterval: 0.2)
     print("closed: resident \(mb(h.residentBytes.load(ordering: .relaxed)))")

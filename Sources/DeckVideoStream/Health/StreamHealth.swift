@@ -17,7 +17,12 @@ public final class StreamHealth: Sendable {
     public let epochChanges = Atomic<UInt64>(0)
     /// Longest "needed and missing" → "in ring" for the live run.
     public let worstDecodeLatencyNanos = Atomic<UInt64>(0)
+    /// Ring + pinned frames resident for this stream.
     public let residentBytes = Atomic<Int>(0)
+    /// Pinned frames only (part of residentBytes).
+    public let pinnedBytes = Atomic<Int>(0)
+    /// Frames served from a pinned range.
+    public let pinHits = Atomic<UInt64>(0)
 
     public init() {}
 

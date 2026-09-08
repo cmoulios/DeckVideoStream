@@ -29,6 +29,7 @@ public struct Frame: @unchecked Sendable {
 public final class DeckVideoStream: @unchecked Sendable {
     public let configuration: Configuration
     public let health = StreamHealth()
+    public let budget: MemoryBudget
 
     private let oracle: PositionOracle
     private let queue: DispatchQueue
@@ -43,8 +44,14 @@ public final class DeckVideoStream: @unchecked Sendable {
     // Worker-only.
     private var live: Reader?
     private var aux: Reader?
+    private var pinReader: Reader?
     private var lastEpoch: UInt64?
     private var idleSince: Double?
+
+    // Hints: written from any thread under `lock`, consumed by the worker.
+    private var loopHint: LoopHint?
+    private var cueHints: [Double] = []
+    private var hintsChanged = false
 
     // Consumer-thread-only health bookkeeping.
     private var lastRequestedIndex = -1
@@ -62,6 +69,7 @@ public final class DeckVideoStream: @unchecked Sendable {
         let source: VideoSource
         let format: PixelFormat
         let ring: FrameRing
+        let pins = PinStore()
         let bytesPerFrame: Int
         let generation: UInt64
         init(source: VideoSource, format: PixelFormat, ringCapacity: Int, generation: UInt64) {
@@ -86,9 +94,11 @@ public final class DeckVideoStream: @unchecked Sendable {
     }
 
     public init(configuration: Configuration = Configuration(),
+                budget: MemoryBudget = .shared,
                 oracle: PositionOracle,
                 label: String = "com.deckvideostream.worker") {
         self.configuration = configuration
+        self.budget = budget
         self.oracle = oracle
         self.queue = DispatchQueue(label: label, qos: .userInteractive)
     }
@@ -145,6 +155,26 @@ public final class DeckVideoStream: @unchecked Sendable {
         return gen
     }
 
+    /// The loop the deck is playing (nil = none). Same value is a no-op.
+    public func setLoopHint(_ hint: LoopHint?) {
+        lock.lock()
+        let changed = hint != loopHint
+        loopHint = hint
+        if changed { hintsChanged = true }
+        lock.unlock()
+        if changed { queue.async { [self] in pass() } }
+    }
+
+    /// File times a jump is likely to land on (hot cues). Same value is a no-op.
+    public func setCueHints(_ seconds: [Double]) {
+        lock.lock()
+        let changed = seconds != cueHints
+        cueHints = seconds
+        if changed { hintsChanged = true }
+        lock.unlock()
+        if changed { queue.async { [self] in pass() } }
+    }
+
     /// Equivalent to the oracle's epoch changing.
     public func invalidate() {
         queue.async { [self] in
@@ -181,12 +211,24 @@ public final class DeckVideoStream: @unchecked Sendable {
         var hitIndex = index
         var exact = true
         var buffer = session.ring.buffer(at: index)
+        var fromPin = false
+        if buffer == nil, let pinned = session.pins.buffer(at: index) {
+            buffer = pinned
+            fromPin = true
+        }
         if buffer == nil, let near = session.ring.nearest(atOrBefore: index, backscan: configuration.backscanFrames) {
             buffer = near.buffer
             hitIndex = near.index
             exact = false
         }
+        if buffer == nil, let near = session.pins.nearest(atOrBefore: index, backscan: configuration.backscanFrames) {
+            buffer = near.buffer
+            hitIndex = near.index
+            exact = false
+            fromPin = true
+        }
         lock.unlock()
+        if fromPin { health.pinHits.wrappingAdd(1, ordering: .relaxed) }
 
         consumerIndex.store(index, ordering: .relaxed)
         if index != lastRequestedIndex {
@@ -212,12 +254,16 @@ public final class DeckVideoStream: @unchecked Sendable {
     private func install(_ new: Session?, generation gen: UInt64) {
         lock.lock()
         guard gen == generation else { lock.unlock(); return }
+        let old = session
         session = new
+        hintsChanged = true
         lock.unlock()
+        if let old { releasePins(of: old) { _ in true } }
         teardownReaders()
         lastEpoch = nil
         idleSince = nil
         health.residentBytes.store(0, ordering: .relaxed)
+        health.pinnedBytes.store(0, ordering: .relaxed)
         setTimerActive(new != nil)
         if new != nil { pass() }
     }
@@ -240,8 +286,10 @@ public final class DeckVideoStream: @unchecked Sendable {
     private func teardownReaders() {
         live?.source.cancel()
         aux?.source.cancel()
+        pinReader?.source.cancel()
         live = nil
         aux = nil
+        pinReader = nil
     }
 
     private func currentSession() -> Session? {
@@ -275,6 +323,7 @@ public final class DeckVideoStream: @unchecked Sendable {
             return
         }
         idleSince = nil
+        reconcilePins(session)
         var samples = [nowIndex]
         samples.reserveCapacity(Int((cfg.lookaheadSeconds + cfg.lookbehindSeconds) / frameDuration) + 2)
         var t = -cfg.lookbehindSeconds
@@ -308,8 +357,11 @@ public final class DeckVideoStream: @unchecked Sendable {
             aux = nil
         }
 
+        servePins(session)
+
         // Evict everything outside the runs (plus a little history behind
-        // whatever the consumer last asked for).
+        // whatever the consumer last asked for). Pinned frames live in the
+        // PinStore, untouched by this.
         // The sampling grid is not frame-aligned, so a run's edges flicker
         // by a frame between passes; keep a margin past each edge or the
         // edge frame is evicted and re-decoded (from its keyframe) forever.
@@ -322,15 +374,175 @@ public final class DeckVideoStream: @unchecked Sendable {
             for run in runs where index >= run.lowerBound - behind && index <= run.upperBound + ahead { return true }
             return false
         }
-        let resident = session.ring.count * session.bytesPerFrame
+        let pinned = session.pins.residentBytes
+        let resident = session.ring.count * session.bytesPerFrame + pinned
         lock.unlock()
         health.residentBytes.store(resident, ordering: .relaxed)
+        health.pinnedBytes.store(pinned, ordering: .relaxed)
     }
 
+    /// First index in `run` that neither the ring nor a pin holds.
     private func firstMissing(in run: ClosedRange<Int>, session: Session) -> Int? {
         lock.lock(); defer { lock.unlock() }
-        for i in run where !session.ring.contains(i) { return i }
+        for i in run where !session.ring.contains(i) && session.pins.buffer(at: i) == nil { return i }
         return nil
+    }
+
+    // MARK: Pins
+
+    /// Turn the current hints into pin ranges: one per cue point, and for
+    /// the loop either the whole range or (over budget / under pressure)
+    /// just its wrap-target head. Ranges whose hint went away are released.
+    private func reconcilePins(_ session: Session) {
+        lock.lock()
+        let changed = hintsChanged
+        hintsChanged = false
+        let loop = loopHint
+        let cues = cueHints
+        lock.unlock()
+        let pressure = budget.underPressure.load(ordering: .relaxed)
+        guard changed || pressure else { return }
+
+        let table = session.table
+        let cfg = configuration
+        let fps = 1 / max(table.nominalFrameDurationSeconds, 1.0 / 240)
+        let pad = Int((cfg.hintPaddingSeconds * fps).rounded(.up))
+        let head = Int((cfg.hintHeadSeconds * fps).rounded(.up))
+
+        var wanted: [(key: PinStore.PinKey, first: Int, length: Int)] = []
+        if let loop, loop.lengthSeconds > 0 {
+            // Cover the wrap target early (see hintPaddingSeconds) AND the
+            // horizon past loop-out: an affine oracle keeps predicting
+            // frames beyond `out` right up to the wrap, and without them
+            // pinned the live reader restarts there every cycle.
+            let overshoot = Int((cfg.lookaheadSeconds * fps).rounded(.up)) + Self.evictionMarginFrames
+            let inIndex = table.index(forSeconds: loop.inSeconds)
+            let outIndex = min(table.count - 1, table.index(forSeconds: loop.outSeconds) + overshoot)
+            let first = max(0, inIndex - pad)
+            let fullLength = outIndex - first + 1
+            let fullBytes = fullLength * session.bytesPerFrame
+            let fits = !pressure && fullBytes <= cfg.pinBudgetBytes
+            if fits {
+                wanted.append((.loop(loop), first, fullLength))
+            } else {
+                wanted.append((.loopHead(loop), first, min(fullLength, pad + head)))
+            }
+        }
+        for cue in cues {
+            let index = table.index(forSeconds: cue)
+            let first = max(0, index - pad)
+            let last = min(table.count - 1, index + head)
+            if last >= first { wanted.append((.cue(cue), first, last - first + 1)) }
+        }
+
+        // Release what's no longer wanted, then reserve budget for new ranges
+        // (a loop that doesn't fit the shared budget degrades to its head).
+        let wantedKeys = Set(wanted.map(\.key))
+        releasePins(of: session) { !wantedKeys.contains($0.key) }
+        for w in wanted {
+            lock.lock()
+            let exists = session.pins.range(for: w.key) != nil
+            lock.unlock()
+            if exists { continue }
+            let first = w.first
+            var length = w.length, key = w.key
+            var bytes = length * session.bytesPerFrame
+            if !budget.reserve(bytes) {
+                // Over the shared budget: a loop degrades to its head, a
+                // cue is skipped.
+                guard case .loop(let hint) = key else { continue }
+                key = .loopHead(hint)
+                length = min(length, pad + head)
+                bytes = length * session.bytesPerFrame
+                guard budget.reserve(bytes) else { continue }
+            }
+            if configuration.verbose {
+                print("[dvs] pin \(key) frames \(first)...\(first + length - 1) (\(bytes >> 20) MB)")
+            }
+            let range = PinStore.Range(key: key, first: first, length: length, bytesPerFrame: session.bytesPerFrame)
+            lock.lock()
+            session.pins.add(range)
+            lock.unlock()
+        }
+        // A range the pin reader was filling may be gone.
+        if let r = pinReader, let target = r.startTarget, findPinRange(session, containing: target) == nil {
+            pinReader?.source.cancel()
+            pinReader = nil
+        }
+    }
+
+    private func findPinRange(_ session: Session, containing index: Int) -> PinStore.Range? {
+        lock.lock(); defer { lock.unlock() }
+        return session.pins.ranges.first { $0.contains(index) }
+    }
+
+    private func releasePins(of session: Session, where predicate: (PinStore.Range) -> Bool) {
+        lock.lock()
+        let removed = session.pins.remove(where: predicate)
+        lock.unlock()
+        for r in removed {
+            budget.release(r.reservedBytes)
+            if configuration.verbose { print("[dvs] unpin \(r.key)") }
+        }
+    }
+
+    /// Fill incomplete pin ranges, one chunk per pass, on a third reader
+    /// so the live and aux readers keep their sequential paths. Frames
+    /// the ring already holds are copied across rather than re-decoded.
+    private func servePins(_ session: Session) {
+        lock.lock()
+        let incomplete = session.pins.ranges.first { !$0.isComplete }
+        lock.unlock()
+        guard let range = incomplete else {
+            if pinReader != nil { pinReader?.source.cancel(); pinReader = nil }
+            return
+        }
+        // Copy over anything the live window already decoded.
+        lock.lock()
+        if let missing = range.firstMissing() {
+            for i in missing...range.last where range.buffer(at: i) == nil {
+                if let b = session.ring.buffer(at: i) { range.insert(b, at: i) }
+            }
+        }
+        let missing = range.firstMissing()
+        lock.unlock()
+        guard let target = missing else { return }
+
+        if pinReader == nil {
+            pinReader = Reader(source: ReaderSource(source: session.source, pixelFormat: session.format), nextIndex: nil)
+        }
+        guard var r = pinReader else { return }
+        defer { pinReader = r }
+        let continues = r.nextIndex.map { $0 <= target && target - $0 <= Self.forwardToleranceFrames } ?? false
+        if !continues {
+            if r.failedAt == target { return }
+            do {
+                try r.source.start(atIndex: target)
+                r.nextIndex = target
+                r.failedAt = nil
+                r.startTarget = target
+                if configuration.verbose { print("[dvs] pin  restart → \(target) for \(range.key)") }
+            } catch {
+                r.failedAt = target
+                r.nextIndex = nil
+                return
+            }
+        }
+        var decoded = 0
+        while decoded < configuration.decodeChunk, let expected = r.nextIndex, expected <= range.last {
+            guard let frame = r.source.next() else {
+                r.nextIndex = nil
+                r.failedAt = expected
+                break
+            }
+            let index = session.table.index(for: frame.presentationTime)
+            lock.lock()
+            range.insert(frame.pixelBuffer, at: index)
+            lock.unlock()
+            r.nextIndex = index + 1
+            decoded += 1
+            health.decodedFrames.wrappingAdd(1, ordering: .relaxed)
+        }
     }
 
     private func serve(run: ClosedRange<Int>, reader: inout Reader?, session: Session, isLive: Bool) {
@@ -412,11 +624,13 @@ public final class DeckVideoStream: @unchecked Sendable {
         }
         guard now - since >= configuration.idleReleaseSeconds else { return }
         teardownReaders()
+        releasePins(of: session) { _ in true }
         lock.lock()
-        let hadFrames = session.ring.count > 0
         session.ring.removeAll()
+        hintsChanged = true   // re-pin when the deck comes back
         lock.unlock()
-        if hadFrames { health.residentBytes.store(0, ordering: .relaxed) }
+        health.residentBytes.store(0, ordering: .relaxed)
+        health.pinnedBytes.store(0, ordering: .relaxed)
     }
 
     /// The future changed: release frames past the consumer's position so
